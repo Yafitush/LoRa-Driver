@@ -1,0 +1,298 @@
+#!/usr/bin/python3m
+
+import base64
+import socket
+import json
+import os
+import logging
+import paramiko
+import time
+import csv
+import sys
+from collections import OrderedDict
+from logging.handlers import RotatingFileHandler
+
+
+class LoRaFilesManager:
+    def __init__(self, logger):
+        """fields ['frequency_hz (OUT)', 'rssi_dbm (OUT)', 'rx_data_id (OUT)', 'channel (OUT)', 'snr_db (OUT)', 'coding_rate (OUT)','port (OUT)',
+                'data_rate (OUT)', 'gateway_id (OUT)', 'radio_id (OUT)', 'end_device_id (OUT)', 'sequence_number (OUT)', 'modulation_type (OUT)',
+                'received_time (OUT)', 'payload (OUT)', 'adr (OUT)'] """
+
+        # Create all directories and files
+        self.MainDir = os.getcwd()
+        self.data_dir = self.MainDir + '/LoRa_data'
+        if not os.path.exists(self.data_dir):
+            os.mkdir(self.data_dir)
+        if not os.path.exists("output.json"):
+            with open('output.json', 'w') as file:
+                json.dump({"Devices": []}, file)
+        if not os.path.exists("get_rx_data"):
+            open("get_rx_data", "w").close()
+
+        self.kerlinkUser = "xxx"
+        self.kerlinkPass = "xxxxxxxxx"
+        self.TIMESTAMP_NAME = "received_time (OUT)"
+        self.kerlinkDataDirectory = "/rx_data/get_rx_data"
+        self.LastDownloadTime = 0
+        self.app_log = logger
+
+    def run(self):
+        self.app_log.info("==============Start running============")
+        while True:
+            self.app_log.info("=====================Start loop================")
+            # delete all csv files from data directory
+            self.deleteAllcsvFiles()
+            # open and read conf file
+            conf_data = json.load(open('conf.json', 'r'))
+            self.app_log.info("Configuration Data:")
+            self.app_log.info(conf_data)
+            # P resent IP addresses from conf file and connect to the GWs
+            for GW_IP in sorted(conf_data.keys(), reverse=False):
+                if self.checkConnectivity(GW_IP, 2222):
+                    self.app_log.info("Can connect to the " + GW_IP)
+                    self.collectData(GW_IP, 2222)
+                    self.merge_all()
+                    self.readDevicesConfig(conf_data, GW_IP)
+                else:
+                    self.app_log.error("Cannot connect to the " + GW_IP)
+            time.sleep(10)
+            self.app_log.info("Sleep 10sec")
+            self.app_log.info("=====================END loop================")
+
+    # C heck connectivity to the GW
+    def checkConnectivity(self, IP, PORT):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sck:
+            sck.settimeout(3)
+            return sck.connect_ex((IP, PORT)) == 0
+
+    # Collect data from Kerlink GW
+    def collectData(self, IP, PORT):
+        # Connect SSH client accepting all host keys.
+        self.app_log.info("Connect SSH client " + IP + ":" + str(PORT) + " accepting all host keys")
+        try:
+            with paramiko.SSHClient() as ssh:
+                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                ssh.connect(IP, port=PORT, username=self.kerlinkUser, password=self.kerlinkPass, timeout=120)
+                # Using the SSH client, create a SFTP client.
+                with ssh.open_sftp() as sftp:
+                    # Create data on the kerlink GW (put emty "get_rx_data" file)
+                    self.app_log.info("Create sftp client")
+                    sftp.put(self.MainDir + "/get_rx_data", self.kerlinkDataDirectory)
+                    time.sleep(3)  # time to create data files
+                    sftp.chdir('rx_data')
+                    # Copy all csv files to the FitPC and delete them on kerlink GW
+                    for filename in sftp.listdir():
+                        try:
+                            if filename.endswith('.csv'):
+                                localpath = self.data_dir + '/' + filename
+                                self.app_log.info("Downloading files ==> " + filename)
+                                sftp.get(filename, localpath)
+                            sftp.remove(filename)
+                        except IOError as e:
+                            self.app_log.info(e)
+        except paramiko.ssh_exception.SSHException as e:
+            self.app_log.exception(e)
+
+    # open all csv files and return only new rows by timestamp
+    def get_new_rows(self, path, last_update_timestamp):
+        new_rows = []  # List of new rows
+        file_list = ['%s/%s' % (path, f) for f in os.listdir(self.data_dir)]  # List of CSV files
+        for f in file_list:  # run on all files
+            try:
+                with open(f, "r") as csvF:
+                    reader = csv.DictReader((line.replace('\0','')for line in csvF))
+                    for row in reader:  # run all rows
+                        if int(row[self.TIMESTAMP_NAME]) > last_update_timestamp:
+                            new_rows.append(row)
+
+            except IOError as e:
+                self.app_log.exception("File not found:")
+                self.app_log.exception(e)
+        return new_rows
+
+    def get_max_timestamp(self, rows):
+        return max([int(row[self.TIMESTAMP_NAME]) for row in rows]) if rows else -1
+
+    def write_new_rows_csv(self, path, rows_list):
+        fieldnames = ['received_time (OUT)', 'end_device_id (OUT)', 'payload (OUT)']  # write only 3 fieldnames from the file
+        if rows_list:  # not empty list
+            writer = csv.DictWriter(open(path, "w"), fieldnames=fieldnames, extrasaction='ignore')
+            writer.writeheader()  # write header to the file
+            for row in rows_list:
+                self.app_log.info("Writing row: %s" % row)
+                writer.writerow(row)
+
+    # merge all csv and filtrening of new rows
+    def merge_all(self):
+        last_update_timestamp = self.get_last_update_timestamp()  # read timestamp from file
+        new_rows = self.get_new_rows(self.data_dir, last_update_timestamp)  # List of new rows (filtering by timestamp)
+        last_update_timestamp = self.get_max_timestamp(new_rows)  # get max timestamp
+        self.write_new_rows_csv("%s/Update.csv" % self.data_dir, new_rows)  # write new rows to file
+        if last_update_timestamp != -1:
+            self.writeLastDownloadTimeToFile(last_update_timestamp)  # write timestamp to file
+
+    # delete all csv files in the start of each loop
+    def deleteAllcsvFiles(self):
+        self.app_log.info("Delete all CSV files" + str(os.listdir(self.data_dir)))
+        fileList = os.listdir(self.data_dir)
+        for file in fileList:
+            os.remove(self.data_dir+"/"+file)
+
+    # Read time of last CSV files download from Kelnink GW to the FitPc from the file
+    def get_last_update_timestamp(self):
+        try:
+            with open("LTD.txt", "r") as LTDfile:
+                LastDownloadTime = int(LTDfile.read())
+                self.app_log.info(" READ LastDownloadTime --> " + str(LastDownloadTime))
+        except IOError as e:
+            LastDownloadTime = 0
+            self.app_log.exception(e)
+        return LastDownloadTime
+
+    # Write time of last CSV files download from Kelnink GW to the FitPc from the file
+    def writeLastDownloadTimeToFile(self, LastDownloadTime):
+        try:
+            with open("LTD.txt", "w") as LTDfile:
+                LTDfile.write(str(LastDownloadTime))
+                self.app_log.info(" WRITE LastDownloadTime --> " + str(LastDownloadTime))
+        except IOError as e:
+            self.app_log.exception(e)
+
+    # Read Device ID from conf.json and search new data for each of them
+    def readDevicesConfig(self, conf_data, GW_IP):
+        payloadNum = 2  # number of payload column in CSV file
+        tsNum = 0       # number of timestamp column in CSV file
+        for dic in conf_data[GW_IP]:
+            deviceID = dic["Device_ID"]
+            # Is there any new information for this device?
+            sensorData = self.searchForDeviceInCsv(deviceID)
+            self.app_log.info("Sensor Data:")
+            self.app_log.info(sensorData)
+            # send data for decoding
+            if sensorData is not None:
+                if dic["Device_type"] == "ELSYS":
+                    self.DecodeElsysPayload(sensorData[payloadNum], dic["Device_ID"], dic["Location"],time.ctime(int(sensorData[tsNum])))
+                if dic["Device_type"] == "LS-112P":
+                    self.DecodeLS112PPayload(sensorData[payloadNum], dic["Device_ID"], dic["Location"],time.ctime(int(sensorData[tsNum])))
+
+    # update output.json file
+    def updateOutputFile(self, dic):
+        # open output.json file
+        out_data = json.load(open('output.json', 'r'), object_pairs_hook=OrderedDict)
+        # if device ID exist in the output.json and what it index
+        index = next((index for (index, jsonDic) in enumerate(out_data["Devices"]) if jsonDic["id"] == dic["id"]), None)
+
+        if index is None:
+            out_data["Devices"].append(dic)
+            self.app_log.info("NEW sensor, append to output file:")
+            self.app_log.info(dic)
+        else:
+            out_data["Devices"][index].update(dic)
+            self.app_log.info("Exist sensor, update output file:")
+            self.app_log.info(dic)
+
+        self.app_log.info("!!!!!!!!!!!!!!!!!!!!!!!!!!!!OUTPUT DATA!!!!!!!!!!!!!!!!!!!!")
+        self.app_log.info(out_data)
+        self.app_log.info("!!!!!!!!!!!!!!!!!!!!!!!!!!!!OUTPUT DATA!!!!!!!!!!!!!!!!!!!!")
+        # write to output.json
+        with open('output.json', 'w') as fileOut:
+            json.dump(out_data, fileOut)
+        # write to csv file for data debuging/testing
+        with open("CSV_out.csv", 'a') as csvfile:
+            file_is_empty = os.stat('CSV_out.csv').st_size == 0
+            headers = ['ts', 'id', 'temperature','humidity','light','motion','co2','vdd','location']
+            writer = csv.DictWriter(csvfile,fieldnames=headers)
+            if file_is_empty:
+                writer.writeheader()
+            writer.writerow(dic)
+
+    def DecodeLS112PPayload(self, payload, id, location, ts):
+        # temp value is 2nd and 3rd byte in payload
+        firstTempByte = 1
+        secondTempByte = 2
+        # humidity value is 4th and 5th byte in payload
+        firstHMByte = 3
+        secondHMByte = 4
+
+        temDict = OrderedDict()
+        self.app_log.info("LS-112P Sensor payload: " + payload)
+        # decode from base64
+        payload = base64.b64decode(payload)
+        temperature = ((payload[firstTempByte] << 8) | (payload[secondTempByte]))/100
+        humidity = ((payload[firstHMByte] << 8) | (payload[secondHMByte]))/100
+        # Create sensor data dic
+        temDict["ts"] = ts
+        temDict["id"] = id
+        temDict["temperature"] = temperature
+        temDict["humidity"] = humidity
+        temDict["location"] = location
+        self.app_log.info("LS-112P Sensor dictionary: " + str(temDict))
+        self.updateOutputFile(temDict)
+
+    def DecodeElsysPayload(self, payload, id, location, ts):
+        tempPattern = 0x01      # temp 2 bytes -3276.8°C -->3276.7°C
+        humidityPattern = 0x02  # Humidity 1 byte  0-100%
+        lightPattern = 0x04     # Light 2 bytes 0-->65535 Lux
+        motionPattern = 0x05    # No of motion 1 byte  0-255
+        co2Pattern = 0x06       # Co2 2 bytes 0-65535 ppm
+        vddPattern = 0x07       # VDD 2byte 0-65535mV
+
+        temDict = OrderedDict()
+        self.app_log.info("Elsys Sensor payload: " + payload)
+        # decode from base64
+        payload = base64.b64decode(payload)
+
+        index = 0
+        while index < len(payload):
+            # print("The byte is " + str(index) + " and value of this byte is "+ str(payload[index]))
+            if payload[index] == tempPattern:
+                temperature = ((payload[index + 1] << 8) | (payload[index+2])) / 10
+                # print("temp is " + str(temperature))
+                index = index + 2
+            elif payload[index] == humidityPattern:
+                humidity = payload[index + 1]
+                # print("humidity is " + str(humidity))
+                index = index+1
+            elif payload[index] == lightPattern:
+                light = (payload[index+1] << 8) | (payload[index+2])
+                # print("light is " + str(light))
+                index = index+2
+            elif payload[index] == motionPattern:
+                motion = payload[index+1]
+                # print("motion is " + str(motion))
+                index = index+1
+            elif payload[index] == co2Pattern:
+                co2 = (payload[index+1] << 8) | (payload[index+2])
+                # print("co2 is " + str(co2))
+                index = index+2
+            elif payload[index] == vddPattern:
+                vdd = (payload[index+1] << 8) | (payload[index+2])
+                # print("vdd is " + str(vdd))
+                index = index+2
+            index = index+1
+        temDict["ts"] = ts
+        temDict["id"] = id
+        temDict["temperature"] = temperature
+        temDict["humidity"] = humidity
+        temDict["light"] = light
+        temDict["motion"] = motion
+        temDict["co2"] = co2
+        temDict["vdd"] = vdd
+        temDict["location"] = location
+        self.app_log.info("ELSYS Sensor dictionary: " + str(temDict))
+        self.updateOutputFile(temDict)
+
+    def searchForDeviceInCsv(self, deviceID):
+        try:
+            with open(self.data_dir + "/Update.csv", "r") as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    if row[1].isdigit():
+                        if int(row[1]) == deviceID:
+                            return row
+        except FileNotFoundError:
+            self.app_log.info("Update.scv file not exist --> no new data")
+            return None
+
+

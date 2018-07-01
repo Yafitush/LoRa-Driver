@@ -1,0 +1,46 @@
+#!/usr/bin/python3m
+import sys
+sys.path.extend(['/opt/smartgreen/DataCollection/Mango','#'])
+from LoRaDB import LoRaDBManager
+from LoRa import LoRaFilesManager
+import threading
+import os
+import logging
+from logging.handlers import RotatingFileHandler
+
+
+def main():
+    print("start running")
+    print("starting LoRaFilesManager thread")
+
+    # Create Logs directory
+    log_dir = os.getcwd() + '/LoRa_logs'
+    if not os.path.exists(log_dir):
+        os.mkdir(log_dir)
+    # Create logging
+    log_formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+    logFile = log_dir + '/logfile'
+    # Maximum 4 logfiles and each of them 50M
+    my_handler = RotatingFileHandler(logFile, mode='a', maxBytes=50 * 1024 * 1024, backupCount=4, encoding=None, delay=0)
+    my_handler.setFormatter(log_formatter)
+    stream_handler = logging.StreamHandler(sys.stderr)
+    my_handler.setLevel(logging.INFO)
+    app_log = logging.getLogger('root')
+    app_log.setLevel(logging.INFO)
+    app_log.addHandler(my_handler)
+
+    files_manager = LoRaFilesManager(app_log)
+    write = threading.Thread(name="LoRaFilesManager", target=files_manager.run)
+    write.daemon = True
+    write.start()
+
+    CLIENT = "Sg"
+    PROJ = "Sg"
+    SITE = "1"
+    ldb = LoRaDBManager(CLIENT, PROJ, SITE, app_log)
+    ldb.run()
+
+
+if __name__ == '__main__':
+    main()
+

@@ -1,0 +1,175 @@
+import sqlalchemy
+import json
+import time
+import MangoClient
+import DataPoint as Dp
+import dataPoints_Functions as dp_f
+import logging
+from logging.handlers import RotatingFileHandler
+import os
+import sys
+
+
+class LoRaDBManager:
+    def __init__(self, client, project, site, logger):
+        self.MINUTES = 3
+        self.applog = logger
+
+        # connect to mango and get a cookie
+        self.mango_ip = "XXXXXX"
+        self.mango_user = "XXXXXXXX"
+        self.mango_password = "XXXXXXXX"
+        self.applog.info("Connecting to mango and getting a cookie")
+        mango_connection = MangoClient.Connect(self.mango_ip, self.mango_user, self.mango_password)
+        while mango_connection.isConnected is not True:
+            self.applog.info("Connection Failed trying again")
+            mango_connection = MangoClient.Connect(self.mango_ip, self.mango_user, self.mango_password)
+            time.sleep(30)
+        self.mango_cookie = mango_connection.COOKIE
+        self.applog.info("Connection Success!")
+        self.applog.info("Cookie: %s" % self.mango_cookie)
+        self.client = client
+        self.project = project
+        self.site = site
+        self.cursor = self.connect_to_db()  # connect to local LoRa DB
+
+    def run(self):
+        try:
+            print("Start Running!")
+            self.applog.info("Start Running!")
+            self.create_pointNames_table()
+            self.create_pointValues_table()
+
+            while True:
+                time.sleep(self.MINUTES*60)
+                self.parse_file()
+        # In case of error delete pointValues table
+        except Exception as e:
+            print(e)
+            self.delete_pointValues_table()
+
+    def connect_to_db(self):
+        print("Connect to LoRa DB")
+        user_name = "XXXX"
+        password = "XXXX"
+        db_ip = "XXXXXX"
+        db_name = "XXXXXXX"
+
+        engine = sqlalchemy.create_engine('mysql+pymysql://' + user_name + ':' + password + '@' + db_ip + '/').connect()
+        sql = "CREATE DATABASE if NOT EXISTS LoRa;"
+        engine.execute(sql)
+        return sqlalchemy.create_engine('mysql+pymysql://' + user_name + ':' + password + '@' + db_ip + '/'+db_name).connect()
+
+    def create_pointNames_table(self):
+        print("Create pointNames table")
+        sql = 'create table if not exists pointNames (pointID varchar(50) NOT NULL UNIQUE, PRIMARY KEY (pointID))'
+        try:
+            self.cursor.execute(sql)
+        except Exception as e:
+            print(e)
+            self.applog.info("EXCEPTION: create_pointNames_table: %s" % e)
+
+    def create_pointValues_table(self):
+        print("Create pointValues table")
+        sql = 'create table if not exists pointValues (pointID varchar(50) NOT NULL UNIQUE, ' \
+              'pointValue VARCHAR(20), PRIMARY KEY (pointID))'
+        try:
+            self.cursor.execute(sql)
+        except Exception as e:
+            print(e)
+            self.applog.info("EXCEPTION: create_pointValues_table: %s" % e)
+
+    def delete_pointValues_table(self):
+        self.applog.info("Delete pointValues table!")
+        sql = 'DROP TABLE if  EXISTS pointValues;'
+        self.cursor.execute(sql)
+
+    def check_if_point_exist(self, dp_xid):
+        print("check_if_point_exist")
+        sql = 'SELECT COUNT(pointID) FROM pointNames WHERE pointID="%s";' % dp_xid
+        try:
+            results = self.cursor.execute(sql)
+            results = results.fetchall()
+            # if 0 - not exist
+            return results[0][0] > 0
+        except Exception as e:
+            print(e)
+            self.applog.info("EXCEPTION: check_if_point_exist: %s, pxid: %s" % e, dp_xid)
+            return True
+
+    def insert_new_point_to_pointNames_table(self, dp_xid):
+        print("insert_new_point_to_pointNames_table")
+        sql = "INSERT INTO pointNames(pointID) VALUES ('%s'); " % dp_xid
+        try:
+            self.cursor.execute(sql)
+        except Exception as e:
+            print(e)
+            self.applog.info("EXCEPTION: insert_new_point_to_pointNames_table: %s, pxid: %s" % e, dp_xid)
+
+    def update_pointValues_table(self, dp_xid, val):
+        print("update_pointValues_table")
+        sql = "SELECT COUNT(pointID) FROM pointValues WHERE pointID = '%s';" % dp_xid
+        results = self.cursor.execute(sql)
+        results = results.fetchall()[0][0]
+        if results == 0:
+            sql = "INSERT INTO pointValues(pointID,pointValue) VALUES ('%s', '%s'); " % (dp_xid, val)
+        else:
+            sql = "UPDATE pointValues SET pointValue=%f WHERE pointID='%s';" % (val, dp_xid)
+        try:
+            self.cursor.execute(sql)
+        except Exception as e:
+            print(e)
+            self.applog.info("EXCEPTION: update_pointValues_table: %s, dpxid: %s , val: %s" % e, dp_xid, val)
+
+    def process_point(self, point_xid, point_val):
+        if point_val is None:
+            return None
+        point_exist = self.check_if_point_exist(point_xid)
+        if not point_exist:
+            dp_name = point_xid.split('_')[-1]
+            ds_name = self.client+"_"+self.project+"_"+self.site+"_LoRaSensors"
+            ds_xid = "DS_"+self.client+"_"+self.project+"_"+self.site+"_LoRaSensors"
+            self.create_new_point(point_xid, dp_name, ds_name, ds_xid)
+            self.insert_new_point_to_pointNames_table(point_xid)
+        self.update_pointValues_table(point_xid, point_val)
+
+    def parse_file(self):
+        with open('output.json', 'r') as fileOut:
+            data = json.load(fileOut)
+            devices = data['Devices']
+            for device in devices:
+                temp = get_device_index_value(device, 'temperature')
+                hum = get_device_index_value(device, 'humidity')
+                co2 = get_device_index_value(device, 'co2')
+                light = get_device_index_value(device, 'light')
+                motion = get_device_index_value(device, 'motion')
+                vdd = get_device_index_value(device, 'vdd')
+
+                location = device['location']
+                location_split = location.split(",")
+                floor = location_split[0].strip().replace(' ', '')
+                env_area = location_split[1].strip().replace(' ', '')
+                point_template = self.client + "_" + self.project + "_" + self.site + "_Sen_" + floor + "_" + env_area
+
+                self.process_point(point_template + "_Temp", temp)
+                self.process_point(point_template + "_Hum", hum)
+                self.process_point(point_template + "_CO2", co2)
+                self.process_point(point_template + "_Light", light)
+                self.process_point(point_template + "_Motion", motion)
+                self.process_point(point_template + "_VDD", vdd)
+
+    def create_new_point(self, dp_xid, dp_name, ds_name, ds_xid,):
+        pl = dp_f.point_locator("SQL", fieldName=dp_xid, dataType="NUMERIC")
+        new_data_point = Dp.DataPoint(deviceName=ds_name, dataSourceXid=ds_xid, name=dp_name, plotType="SPLINE",
+                                      setPointLocator=pl, xid=dp_xid, dataSourceName=ds_name)
+        created_point = dp_f.insertUpdateDataPoint(self.mango_ip, self. mango_cookie, new_data_point)
+        return created_point
+
+
+def get_device_index_value(device, index):
+    try:
+        my_index = device[index]
+    except:
+        my_index = None
+    return my_index
+
